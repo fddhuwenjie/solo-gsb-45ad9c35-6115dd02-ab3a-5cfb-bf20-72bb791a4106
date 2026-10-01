@@ -17,6 +17,10 @@
 交点在线段上的时间比例插值。门线含三个及以上折点时，在整条门线层面归并
 共享内部折点：轨迹恰好穿过折点且折点两侧邻接段分居轨迹两侧时按一次横穿
 核算，邻接段同侧时按擦碰忽略。
+
+有序门线巡检路线核验：按时间窗内当前 crossing 重放一组有序（门线、方向）
+检查点，只有匹配下一个检查点的穿越推进；后续门线或当前门线反向穿越为顺序
+违规，超过与上一点的最长间隔为超时。
 """
 from __future__ import annotations
 
@@ -506,6 +510,181 @@ def compute_crossings(
             ))
     crossings.sort(key=lambda c: (c.ts, c.gate_id))
     return crossings
+
+
+# ---------- 有序门线巡检路线核验 ----------
+
+
+CHECKPOINT_PASSED = "passed"
+CHECKPOINT_SEQUENCE_VIOLATION = "sequence_violation"
+CHECKPOINT_TIMEOUT = "timeout"
+CHECKPOINT_PENDING = "pending"
+CHECKPOINT_SKIPPED = "skipped"
+
+ROUTE_VIOLATION_SEQUENCE = "sequence_violation"
+ROUTE_VIOLATION_TIMEOUT = "timeout"
+
+
+@dataclass
+class RouteCheckpoint:
+    """巡检路线中的一个有序门线检查点。"""
+
+    sequence: int
+    gate_id: int
+    direction: str
+    max_interval_s: float | None
+
+
+@dataclass
+class RouteCrossing:
+    """路线核验使用的一次门线穿越（按时间升序重放）。"""
+
+    gate_id: int
+    direction: str
+    ts: float
+
+
+@dataclass
+class RouteCheckpointResult:
+    sequence: int
+    gate_id: int
+    required_direction: str
+    max_interval_s: float | None
+    status: str
+    passed_ts: float | None = None
+    failure_reason: str | None = None
+
+
+@dataclass
+class RouteViolation:
+    type: str
+    at: float
+    expected_sequence: int
+    actual_gate_id: int | None = None
+    actual_direction: str | None = None
+
+
+@dataclass
+class RouteVerification:
+    passed: bool
+    first_violation_ts: float | None
+    violation: RouteViolation | None
+    results: list[RouteCheckpointResult]
+
+
+def compute_route_verification(
+    checkpoints: list[RouteCheckpoint],
+    crossings: list[RouteCrossing],
+    start: float,
+    end: float,
+) -> RouteVerification:
+    """在 [start, end) 内按当前门线穿越记录重放一条有序巡检路线。
+
+    只有“门线 + 方向”均匹配下一个检查点的穿越才推进；已通过检查点的门线
+    穿越以及路线外门线穿越均忽略。遇到后续检查点的任意方向穿越，或当前
+    检查点门线的反向穿越，立即在当前检查点记录顺序违规。
+
+    第二个及以后检查点的允许时刻为上一点通过时刻 + max_interval_s；恰好
+    等于该时刻仍算通过，严格晚于该时刻则超时。首个违规后的检查点均跳过。
+    """
+    results = [
+        RouteCheckpointResult(
+            sequence=cp.sequence,
+            gate_id=cp.gate_id,
+            required_direction=cp.direction,
+            max_interval_s=cp.max_interval_s,
+            status=CHECKPOINT_PENDING,
+        )
+        for cp in checkpoints
+    ]
+    by_gate = {cp.gate_id: idx for idx, cp in enumerate(checkpoints)}
+    next_idx = 0
+    last_pass_ts = start
+    violation: RouteViolation | None = None
+
+    def deadline_for(idx: int) -> float:
+        if idx == 0:
+            return math.inf
+        return last_pass_ts + checkpoints[idx].max_interval_s  # type: ignore[operator]
+
+    def mark_sequence(crossing: RouteCrossing) -> None:
+        nonlocal violation
+        cp = checkpoints[next_idx]
+        if crossing.gate_id == cp.gate_id:
+            reason = f"门线 {cp.gate_id} 需要 {cp.direction} 穿越，实际为 {crossing.direction}"
+        else:
+            reason = (
+                f"尚未通过检查点 {cp.sequence}（门线 {cp.gate_id}），"
+                f"先遇到门线 {crossing.gate_id} 穿越"
+            )
+        results[next_idx].status = CHECKPOINT_SEQUENCE_VIOLATION
+        results[next_idx].failure_reason = reason
+        violation = RouteViolation(
+            type=ROUTE_VIOLATION_SEQUENCE,
+            at=crossing.ts,
+            expected_sequence=cp.sequence,
+            actual_gate_id=crossing.gate_id,
+            actual_direction=crossing.direction,
+        )
+        for idx in range(next_idx + 1, len(results)):
+            results[idx].status = CHECKPOINT_SKIPPED
+            results[idx].failure_reason = "前序检查点已违规"
+
+    def mark_timeout(at: float) -> None:
+        nonlocal violation
+        cp = checkpoints[next_idx]
+        results[next_idx].status = CHECKPOINT_TIMEOUT
+        results[next_idx].failure_reason = (
+            f"超过与上一检查点的最大间隔 {cp.max_interval_s:g} 秒"
+        )
+        violation = RouteViolation(
+            type=ROUTE_VIOLATION_TIMEOUT,
+            at=at,
+            expected_sequence=cp.sequence,
+        )
+        for idx in range(next_idx + 1, len(results)):
+            results[idx].status = CHECKPOINT_SKIPPED
+            results[idx].failure_reason = "前序检查点已超时"
+
+    ordered = sorted(crossings, key=lambda c: (c.ts, c.gate_id))
+    for crossing in ordered:
+        if violation is not None:
+            break
+        if not start <= crossing.ts < end:
+            continue
+        idx = by_gate.get(crossing.gate_id)
+        if idx is None or idx < next_idx:
+            continue  # 路线外门线，或已通过检查点的重复穿越
+
+        deadline = deadline_for(next_idx)
+        if crossing.ts > deadline:
+            mark_timeout(deadline)
+            break
+
+        cp = checkpoints[next_idx]
+        if idx > next_idx:
+            mark_sequence(crossing)
+            break
+        if crossing.direction != cp.direction:
+            mark_sequence(crossing)
+            break
+
+        results[next_idx].status = CHECKPOINT_PASSED
+        results[next_idx].passed_ts = crossing.ts
+        last_pass_ts = crossing.ts
+        next_idx += 1
+
+    if violation is None and next_idx < len(checkpoints):
+        deadline = deadline_for(next_idx)
+        if end > deadline:
+            mark_timeout(deadline)
+
+    return RouteVerification(
+        passed=violation is None and next_idx == len(checkpoints),
+        first_violation_ts=violation.at if violation is not None else None,
+        violation=violation,
+        results=results,
+    )
 
 
 # ---------- 应急清场核验 ----------

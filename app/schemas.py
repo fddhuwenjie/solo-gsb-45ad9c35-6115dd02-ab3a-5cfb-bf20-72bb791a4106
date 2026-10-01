@@ -134,6 +134,80 @@ class CrossingOut(BaseModel):
     lon: float = Field(description="交点经度")
 
 
+class InspectionCheckpointCreate(BaseModel):
+    gate_id: int = Field(description="已有门线 ID；同一路线内不得重复")
+    direction: Literal["forward", "reverse"] = Field(description="要求的穿越方向")
+    max_interval_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="与上一检查点通过时刻的最大间隔（秒）；首个检查点必须为 null",
+    )
+
+
+class InspectionRouteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    checkpoints: list[InspectionCheckpointCreate] = Field(min_length=2, max_length=8)
+
+    @model_validator(mode="after")
+    def check_checkpoints(self):
+        if self.checkpoints[0].max_interval_s is not None:
+            raise ValueError("首个检查点不得设置 max_interval_s")
+        if any(cp.max_interval_s is None for cp in self.checkpoints[1:]):
+            raise ValueError("后续检查点必须设置与上一点的 max_interval_s")
+        gate_ids = [cp.gate_id for cp in self.checkpoints]
+        if len(gate_ids) != len(set(gate_ids)):
+            raise ValueError("路线内门线不得重复")
+        return self
+
+
+class InspectionCheckpointOut(BaseModel):
+    sequence: int
+    gate_id: int
+    direction: Literal["forward", "reverse"]
+    max_interval_s: float | None
+
+
+class InspectionRouteOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    checkpoints: list[InspectionCheckpointOut]
+    created_at: datetime
+
+
+class InspectionViolationOut(BaseModel):
+    type: Literal["sequence_violation", "timeout"]
+    at: datetime = Field(description="首个违规时刻；超时为超过间隔的时刻")
+    expected_sequence: int
+    actual_gate_id: int | None = Field(
+        description="顺序违规时实际穿越的门线；超时时为 null"
+    )
+    actual_direction: Literal["forward", "reverse"] | None = None
+
+
+class InspectionCheckpointResultOut(BaseModel):
+    sequence: int
+    gate_id: int
+    required_direction: Literal["forward", "reverse"]
+    max_interval_s: float | None
+    status: Literal["passed", "sequence_violation", "timeout", "pending", "skipped"]
+    passed_at: datetime | None = None
+    failure_reason: str | None = None
+
+
+class InspectionReportOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    device_id: str
+    start: datetime
+    end: datetime
+    passed: bool
+    first_violation_at: datetime | None
+    violation: InspectionViolationOut | None
+    checkpoints: list[InspectionCheckpointResultOut]
+
+
 class ClearanceTaskCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200, description="清场任务名称")
     start_at: datetime = Field(description="清场开始时刻（ISO 8601），起始名单边界含该时刻")

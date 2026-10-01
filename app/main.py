@@ -16,11 +16,14 @@ from .engine import (
     FenceConfig,
     GateLine,
     ProjectedFence,
+    RouteCheckpoint,
+    RouteCrossing,
     TrackPoint,
     compute_clearance,
     compute_crossings,
     compute_events,
     compute_occupancy_segments,
+    compute_route_verification,
     project_points,
 )
 from .models import (
@@ -32,6 +35,8 @@ from .models import (
     Event,
     Fence,
     GateLineRow,
+    InspectionCheckpoint,
+    InspectionRoute,
     TrackPointRow,
 )
 from .schemas import (
@@ -52,6 +57,12 @@ from .schemas import (
     GateLineCreate,
     GateLineOut,
     IngestResult,
+    InspectionCheckpointOut,
+    InspectionCheckpointResultOut,
+    InspectionReportOut,
+    InspectionRouteCreate,
+    InspectionRouteOut,
+    InspectionViolationOut,
     OccupancyOut,
     OccupancySegmentOut,
     PointBatch,
@@ -82,8 +93,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算与应急清场核验",
-    version="1.3.0",
+                "支持围栏容量核算、定向门线穿越核算、有序门线巡检路线核验与应急清场核验",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -233,6 +244,12 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
     db.query(CapacityRule).filter_by(fence_id=fence_id).delete()
     db.query(Crossing).filter_by(fence_id=fence_id).delete()
     db.query(GateLineRow).filter_by(fence_id=fence_id).delete()
+    db.query(InspectionCheckpoint).filter(
+        InspectionCheckpoint.route_id.in_(
+            db.query(InspectionRoute.id).filter_by(fence_id=fence_id)
+        )
+    ).delete(synchronize_session=False)
+    db.query(InspectionRoute).filter_by(fence_id=fence_id).delete()
     db.query(ClearanceTask).filter_by(fence_id=fence_id).delete()
     db.delete(fence)
     db.commit()
@@ -533,6 +550,13 @@ def delete_gate(fence_id: int, gate_id: int, db: Session = Depends(get_db)):
     gate = db.get(GateLineRow, gate_id)
     if gate is None or gate.fence_id != fence_id:
         raise HTTPException(status_code=404, detail="门线不存在")
+    referenced = (
+        db.query(InspectionCheckpoint.id)
+        .filter_by(gate_id=gate_id)
+        .first()
+    )
+    if referenced is not None:
+        raise HTTPException(status_code=409, detail="门线已被巡检路线引用，不能删除")
     db.query(Crossing).filter_by(gate_id=gate_id).delete()
     db.delete(gate)
     db.commit()
@@ -600,6 +624,219 @@ def list_crossings(
             lon=c.lon,
         ))
     return result
+
+
+# ---------- 有序门线巡检路线 ----------
+
+
+def route_out(
+    route: InspectionRoute, checkpoints: list[InspectionCheckpoint]
+) -> InspectionRouteOut:
+    return InspectionRouteOut(
+        id=route.id,
+        fence_id=route.fence_id,
+        name=route.name,
+        checkpoints=[
+            InspectionCheckpointOut(
+                sequence=cp.sequence,
+                gate_id=cp.gate_id,
+                direction=cp.direction,
+                max_interval_s=cp.max_interval_s,
+            )
+            for cp in sorted(checkpoints, key=lambda cp: cp.sequence)
+        ],
+        created_at=to_iso(route.created_at),
+    )
+
+
+def _get_route(db: Session, fence_id: int, route_id: int) -> InspectionRoute:
+    route = db.get(InspectionRoute, route_id)
+    if route is None or route.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="巡检路线不存在")
+    return route
+
+
+@app.post(
+    "/fences/{fence_id}/inspection-routes",
+    response_model=InspectionRouteOut,
+    status_code=201,
+)
+def create_inspection_route(
+    fence_id: int, body: InspectionRouteCreate, db: Session = Depends(get_db)
+):
+    """创建 2～8 个按顺序排列的门线检查点组成的巡检路线。
+
+    检查点引用的门线必须存在且属于当前围栏，同一路线不得重复引用同一门线。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+
+    gates = {
+        g.id: g
+        for g in db.query(GateLineRow).filter_by(fence_id=fence_id).all()
+    }
+    for cp in body.checkpoints:
+        if cp.gate_id not in gates:
+            raise HTTPException(status_code=422, detail=f"门线 {cp.gate_id} 不存在或不属于该围栏")
+
+    route = InspectionRoute(
+        fence_id=fence_id,
+        name=body.name,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(route)
+    db.flush()
+    for seq, cp in enumerate(body.checkpoints, start=1):
+        db.add(InspectionCheckpoint(
+            route_id=route.id,
+            sequence=seq,
+            gate_id=cp.gate_id,
+            direction=cp.direction,
+            max_interval_s=cp.max_interval_s,
+        ))
+    db.commit()
+    db.refresh(route)
+    return route_out(route, db.query(InspectionCheckpoint).filter_by(route_id=route.id).all())
+
+
+@app.get("/fences/{fence_id}/inspection-routes", response_model=list[InspectionRouteOut])
+def list_inspection_routes(fence_id: int, db: Session = Depends(get_db)):
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    routes = (
+        db.query(InspectionRoute)
+        .filter_by(fence_id=fence_id)
+        .order_by(InspectionRoute.id)
+        .all()
+    )
+    route_ids = [r.id for r in routes]
+    checkpoints = (
+        db.query(InspectionCheckpoint)
+        .filter(InspectionCheckpoint.route_id.in_(route_ids))
+        .all()
+        if route_ids
+        else []
+    )
+    cps_by_route: dict[int, list[InspectionCheckpoint]] = {}
+    for cp in checkpoints:
+        cps_by_route.setdefault(cp.route_id, []).append(cp)
+    return [route_out(r, cps_by_route.get(r.id, [])) for r in routes]
+
+
+@app.get(
+    "/fences/{fence_id}/inspection-routes/{route_id}",
+    response_model=InspectionRouteOut,
+)
+def get_inspection_route(fence_id: int, route_id: int, db: Session = Depends(get_db)):
+    route = _get_route(db, fence_id, route_id)
+    checkpoints = (
+        db.query(InspectionCheckpoint)
+        .filter_by(route_id=route.id)
+        .order_by(InspectionCheckpoint.sequence)
+        .all()
+    )
+    return route_out(route, checkpoints)
+
+
+@app.delete("/fences/{fence_id}/inspection-routes/{route_id}", status_code=204)
+def delete_inspection_route(fence_id: int, route_id: int, db: Session = Depends(get_db)):
+    route = _get_route(db, fence_id, route_id)
+    db.query(InspectionCheckpoint).filter_by(route_id=route.id).delete()
+    db.delete(route)
+    db.commit()
+
+
+@app.get(
+    "/fences/{fence_id}/inspection-routes/{route_id}/report",
+    response_model=InspectionReportOut,
+)
+def inspection_route_report(
+    fence_id: int,
+    route_id: int,
+    device_id: str = Query(..., min_length=1, max_length=100),
+    start: datetime = Query(description="核验起始时间（ISO 8601，含）"),
+    end: datetime = Query(description="核验结束时间（ISO 8601，不含）"),
+    db: Session = Depends(get_db),
+):
+    """按 [start, end) 内当前门线穿越记录实时重放路线核验结果。
+
+    报告不保存快照；补录乱序轨迹点导致穿越整体重算后，再次查询即按最新结果核验。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    route = _get_route(db, fence_id, route_id)
+    start_ts, end_ts = to_epoch(start), to_epoch(end)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="start 必须早于 end")
+
+    cp_rows = (
+        db.query(InspectionCheckpoint)
+        .filter_by(route_id=route.id)
+        .order_by(InspectionCheckpoint.sequence)
+        .all()
+    )
+    crossing_rows = (
+        db.query(Crossing)
+        .filter(
+            Crossing.fence_id == fence_id,
+            Crossing.device_id == device_id,
+            Crossing.ts >= start_ts,
+            Crossing.ts < end_ts,
+        )
+        .order_by(Crossing.ts, Crossing.gate_id, Crossing.id)
+        .all()
+    )
+
+    verification = compute_route_verification(
+        [
+            RouteCheckpoint(
+                sequence=cp.sequence,
+                gate_id=cp.gate_id,
+                direction=cp.direction,
+                max_interval_s=cp.max_interval_s,
+            )
+            for cp in cp_rows
+        ],
+        [
+            RouteCrossing(gate_id=c.gate_id, direction=c.direction, ts=c.ts)
+            for c in crossing_rows
+        ],
+        start_ts,
+        end_ts,
+    )
+    return InspectionReportOut(
+        id=route.id,
+        fence_id=fence_id,
+        name=route.name,
+        device_id=device_id,
+        start=to_iso(start_ts),
+        end=to_iso(end_ts),
+        passed=verification.passed,
+        first_violation_at=to_iso(verification.first_violation_ts),
+        violation=(
+            InspectionViolationOut(
+                type=verification.violation.type,
+                at=to_iso(verification.violation.at),
+                expected_sequence=verification.violation.expected_sequence,
+                actual_gate_id=verification.violation.actual_gate_id,
+                actual_direction=verification.violation.actual_direction,
+            )
+            if verification.violation is not None
+            else None
+        ),
+        checkpoints=[
+            InspectionCheckpointResultOut(
+                sequence=r.sequence,
+                gate_id=r.gate_id,
+                required_direction=r.required_direction,
+                max_interval_s=r.max_interval_s,
+                status=r.status,
+                passed_at=to_iso(r.passed_ts),
+                failure_reason=r.failure_reason,
+            )
+            for r in verification.results
+        ],
+    )
 
 
 # ---------- 应急清场核验 ----------

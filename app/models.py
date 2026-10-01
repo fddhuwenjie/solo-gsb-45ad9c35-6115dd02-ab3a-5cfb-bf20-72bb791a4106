@@ -88,6 +88,31 @@ class Crossing(Base):
     lon: Mapped[float] = mapped_column(Float)              # 交点经度
 
 
+class InspectionRoute(Base):
+    __tablename__ = "inspection_routes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class InspectionCheckpoint(Base):
+    __tablename__ = "inspection_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("route_id", "sequence", name="uq_route_sequence"),
+        UniqueConstraint("route_id", "gate_id", name="uq_route_gate"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    route_id: Mapped[int] = mapped_column(Integer, index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    gate_id: Mapped[int] = mapped_column(Integer, index=True)
+    direction: Mapped[str] = mapped_column(String(10))     # forward | reverse
+    # 与上一检查点通过时刻的最大间隔（秒）；首个检查点为 None
+    max_interval_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 class ClearanceTask(Base):
     __tablename__ = "clearance_tasks"
 
