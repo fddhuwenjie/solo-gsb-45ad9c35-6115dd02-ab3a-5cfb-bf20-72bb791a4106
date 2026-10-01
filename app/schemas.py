@@ -166,3 +166,78 @@ class ClearanceSummaryOut(BaseModel):
 class ClearanceReportOut(ClearanceTaskOut):
     summary: ClearanceSummaryOut
     devices: list[ClearanceDeviceOut] = Field(description="起始名单设备的核验结果，按 ID 排序")
+
+
+# ---------- 有序门线巡检路线 ----------
+
+
+class InspectionCheckpointCreate(BaseModel):
+    gate_id: int = Field(description="已有门线 ID，必须属于路线所属围栏")
+    direction: Literal["forward", "reverse"] = Field(description="要求的穿越方向")
+    max_interval_s: float | None = Field(
+        default=None,
+        ge=0,
+        description="与上一检查点的最长允许间隔（秒）；首点必须省略（null）",
+    )
+
+
+class InspectionRouteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="巡检路线名称")
+    checkpoints: list[InspectionCheckpointCreate] = Field(
+        min_length=2, max_length=8, description="按顺序排列的门线检查点（2～8 个）"
+    )
+
+    @model_validator(mode="after")
+    def check_intervals_and_gates(self):
+        if self.checkpoints[0].max_interval_s is not None:
+            raise ValueError("首个检查点不设与上一点的间隔，max_interval_s 必须省略")
+        for cp in self.checkpoints[1:]:
+            if cp.max_interval_s is None:
+                raise ValueError("除首个检查点外，每项都必须给出 max_interval_s")
+        gate_ids = [cp.gate_id for cp in self.checkpoints]
+        if len(set(gate_ids)) != len(gate_ids):
+            raise ValueError("路线内门线不得重复")
+        return self
+
+
+class InspectionCheckpointOut(BaseModel):
+    position: int = Field(description="检查点序号（从 0 起）")
+    gate_id: int
+    direction: Literal["forward", "reverse"]
+    direction_name: str = Field(description="要求方向的名称（取门线的正向/反向名称）")
+    max_interval_s: float | None
+
+
+class InspectionRouteOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    checkpoints: list[InspectionCheckpointOut] = Field(description="按顺序排列的检查点")
+    created_at: datetime
+
+
+class InspectionCheckpointResultOut(BaseModel):
+    position: int = Field(description="检查点序号（从 0 起）")
+    gate_id: int
+    direction: Literal["forward", "reverse"]
+    direction_name: str
+    status: Literal["passed", "timeout", "sequence_violation", "not_reached"] = Field(
+        description="passed=按要求通过；timeout=超过最长间隔；"
+                    "sequence_violation=顺序违规（反向穿越或后续门线先被穿越）；"
+                    "not_reached=此前已失败或窗口结束仍未到达"
+    )
+    passed_at: datetime | None = Field(description="通过时刻；未通过为 null")
+    failed_at: datetime | None = Field(
+        description="timeout 为间隔截止时刻；sequence_violation 为违规穿越时刻；其余为 null"
+    )
+
+
+class InspectionReportOut(InspectionRouteOut):
+    device_id: str
+    start: datetime
+    end: datetime
+    passed: bool = Field(description="全部检查点按序、按方向且未超间隔地通过")
+    first_violation_at: datetime | None = Field(description="首个违规时刻；全部通过为 null")
+    results: list[InspectionCheckpointResultOut] = Field(
+        description="每个检查点的通过时刻或失败原因，按顺序排列"
+    )

@@ -97,3 +97,29 @@ class ClearanceTask(Base):
     start_ts: Mapped[float] = mapped_column(Float)     # 清场开始时刻（epoch 秒，名单边界含）
     deadline_ts: Mapped[float] = mapped_column(Float)  # 清场截止时刻（epoch 秒，须晚于开始）
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class InspectionRouteRow(Base):
+    __tablename__ = "inspection_routes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class InspectionCheckpointRow(Base):
+    __tablename__ = "inspection_checkpoints"
+    # (route_id, position) 唯一：路线内检查点序号唯一；position 从 0 起按数组顺序
+    __table_args__ = (
+        UniqueConstraint("route_id", "position", name="uq_route_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    route_id: Mapped[int] = mapped_column(Integer, index=True)
+    position: Mapped[int] = mapped_column(Integer)   # 检查点在路线中的序号（0 起）
+    gate_id: Mapped[int] = mapped_column(Integer, index=True)
+    direction: Mapped[str] = mapped_column(String(10))      # forward | reverse
+    max_interval_s: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )  # 与上一检查点的最长间隔（秒）；首点为 None

@@ -17,6 +17,11 @@
 交点在线段上的时间比例插值。门线含三个及以上折点时，在整条门线层面归并
 共享内部折点：轨迹恰好穿过折点且折点两侧邻接段分居轨迹两侧时按一次横穿
 核算，邻接段同侧时按擦碰忽略。
+
+有序门线巡检路线核验：路线是 2～8 个按序排列的门线检查点（门线 + 要求
+方向 + 与上一点的最长间隔，首点无间隔）。在给定设备与 [start, end) 窗口
+上按当前穿越记录时间重放：只有匹配下一个检查点的穿越才推进；当前门线的
+反向穿越或后续门线的穿越立即判顺序违规；超过间隔判超时；其他门线忽略。
 """
 from __future__ import annotations
 
@@ -581,3 +586,151 @@ def compute_clearance(
 
     results.sort(key=lambda r: r.device_id)
     return ClearanceReport(start=start, deadline=deadline, results=results)
+
+
+# ---------- 有序门线巡检路线核验 ----------
+
+
+CHECKPOINT_PASSED = "passed"                  # 按序、按方向、未超间隔通过
+CHECKPOINT_TIMEOUT = "timeout"               # 与上一检查点的间隔超过上限
+CHECKPOINT_SEQUENCE_VIOLATION = "sequence_violation"  # 反向穿越或后续门线先被穿越
+CHECKPOINT_NOT_REACHED = "not_reached"       # 此前已失败或窗口结束仍未到达
+
+
+@dataclass
+class InspectionCheckpoint:
+    """巡检路线上的一个有序门线检查点。"""
+
+    position: int                 # 路线中的序号（从 0 起）
+    gate_id: int
+    direction: str                # 要求的穿越方向 forward | reverse
+    max_interval_s: float | None  # 与上一检查点通过时刻的最长间隔；首点为 None
+
+
+@dataclass
+class InspectionCheckpointResult:
+    """单个检查点的核验结果。"""
+
+    position: int
+    gate_id: int
+    direction: str
+    status: str
+    passed_ts: float | None = None    # status == passed 时的通过时刻
+    failed_ts: float | None = None    # timeout 的间隔截止时刻 / 顺序违规时刻
+
+
+@dataclass
+class InspectionReport:
+    """巡检路线在给定设备与 [start, end) 窗口上的核验报告。"""
+
+    route_id: int
+    device_id: str
+    start: float
+    end: float
+    results: list[InspectionCheckpointResult]
+
+    @property
+    def passed(self) -> bool:
+        return len(self.results) > 0 and all(
+            r.status == CHECKPOINT_PASSED for r in self.results
+        )
+
+    @property
+    def first_violation_ts(self) -> float | None:
+        for r in self.results:
+            if r.failed_ts is not None:
+                return r.failed_ts
+        return None
+
+
+def compute_inspection_report(
+    route_id: int,
+    device_id: str,
+    checkpoints: list[InspectionCheckpoint],
+    crossings: list[tuple[int, str, float]],
+    start: float,
+    end: float,
+) -> InspectionReport:
+    """按当前穿越记录重放有序门线巡检路线，核验设备在 [start, end) 内是否按序通过。
+
+    crossings 为 (gate_id, direction, ts)，重放前按 (ts, gate_id) 升序排列。
+    从检查点 0 开始逐一看待窗口内（start <= ts < end）的穿越：
+
+    - 当前等待检查点的门线、方向都匹配 -> 通过并推进到下一检查点，记录穿越时刻；
+    - 当前检查点门线的**反向**穿越 -> 立即顺序违规（记在该检查点，时刻为穿越时刻）；
+    - **后续检查点**门线的**任意方向**穿越 -> 立即顺序违规（记在该后续检查点，
+      “先穿了后面的门”，无论正反都说明路线顺序被破坏）；
+    - 已通过检查点门线与其他门线的穿越一律忽略。
+
+    超时：自上一检查点通过（首点为窗口 start）起，超过该检查点 max_interval_s
+    仍未匹配，即在间隔截止时刻标记超时——即使在截止之后才补上匹配穿越。
+    一旦发生任何违规，重放终止，其余检查点标记 not_reached；窗口结束时尚未
+    到达且间隔已超限的检查点同样标记超时。
+    """
+    results = [
+        InspectionCheckpointResult(
+            position=cp.position, gate_id=cp.gate_id, direction=cp.direction,
+            status=CHECKPOINT_NOT_REACHED,
+        )
+        for cp in checkpoints
+    ]
+    gate_to_position = {cp.gate_id: cp.position for cp in checkpoints}
+
+    current = 0  # 下一个待匹配检查点序号
+    last_pass_ts = start
+    violated = False
+
+    def deadline_of(pos: int) -> float | None:
+        interval = checkpoints[pos].max_interval_s
+        return None if interval is None else last_pass_ts + interval
+
+    ordered = sorted(crossings, key=lambda c: (c[2], c[0]))
+    for gate_id, direction, ts in ordered:
+        if violated or ts < start or ts >= end:
+            continue
+        # 先判超时：间隔截止时刻已到（含等于，间隔允许等于上限）
+        limit_ts = deadline_of(current)
+        if limit_ts is not None and ts > limit_ts:
+            results[current].status = CHECKPOINT_TIMEOUT
+            results[current].failed_ts = limit_ts
+            violated = True
+            break
+
+        pos = gate_to_position.get(gate_id)
+        if pos is None:
+            continue  # 其他门线忽略
+        if pos == current:
+            if direction == checkpoints[current].direction:
+                results[current].status = CHECKPOINT_PASSED
+                results[current].passed_ts = ts
+                last_pass_ts = ts
+                current += 1
+                if current == len(checkpoints):
+                    break
+            else:
+                # 当前检查点门线的反向穿越：立即顺序违规
+                results[current].status = CHECKPOINT_SEQUENCE_VIOLATION
+                results[current].failed_ts = ts
+                violated = True
+        elif pos > current:
+            # 后续检查点门线：任意方向穿越都说明先穿了后面的门 -> 顺序违规
+            results[pos].status = CHECKPOINT_SEQUENCE_VIOLATION
+            results[pos].failed_ts = ts
+            violated = True
+        # pos < current 的门线已通过，再次穿越（任一方向）忽略
+
+    if not violated and current < len(checkpoints):
+        # 窗口结束仍未匹配：间隔已超限按超时，否则保持未到达
+        limit_ts = deadline_of(current)
+        if limit_ts is not None and end > limit_ts:
+            results[current].status = CHECKPOINT_TIMEOUT
+            results[current].failed_ts = limit_ts
+        # 其余检查点保持 not_reached；current 本身未超限也保持 not_reached
+
+    return InspectionReport(
+        route_id=route_id,
+        device_id=device_id,
+        start=start,
+        end=end,
+        results=results,
+    )

@@ -8,6 +8,7 @@
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
 - **围栏容量核算**：按生效时刻维护正整数容量上限规则，查询任意 `[start, end)` 窗口的占用分段与超限明细
 - **定向门线穿越核算**：围栏内保存简单 GeoJSON LineString 门线（正/反向名称 + 最小位移），只承认相邻轨迹点对门线的**单点横穿**，穿越时刻按交点比例插值
+- **有序门线巡检路线核验**：路线保存 2～8 个按序排列的门线检查点（门线 + 方向 + 与上一点的最长间隔，首点无间隔）；核验设备在 `[start, end)` 窗口内是否按序、按方向且不超间隔地逐点通过，报告实时由当前穿越记录重算
 - **应急清场核验**：为围栏创建含名称、开始时刻、截止时刻的清场任务；报告从 enter/leave 事件实时还原起始在场名单并逐机核验 cleared/remaining
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
@@ -304,6 +305,93 @@ curl http://localhost:8000/fences/1/clearance-tasks/1/report
 5. **汇总与排序**：`summary` 给出 `start_count`（起始人数）、`cleared_count`（按时清场）、`remaining_count`（未清场）；`devices` 按设备 ID 升序。
 6. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。补录乱序轨迹点触发事件重算后，再次查询得到的起始名单与 cleared/remaining 结果同步更新，不保留旧快照。
 
+### 11. 有序门线巡检路线核验
+
+在围栏内创建有序门线巡检路线：2～8 个**按顺序排列**的门线检查点，每项指定一条**已有门线**、要求的穿越方向（`forward`/`reverse`）以及与上一检查点通过时刻的**最长间隔秒数**；首点不设间隔。
+
+```bash
+curl -X POST http://localhost:8000/fences/1/inspection-routes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "南门入园巡检",
+    "checkpoints": [
+      {"gate_id": 1, "direction": "forward"},
+      {"gate_id": 2, "direction": "forward", "max_interval_s": 120},
+      {"gate_id": 3, "direction": "reverse", "max_interval_s": 180}
+    ]
+  }'
+```
+
+- 创建时校验：检查点数量必须为 **2～8**；门线必须**全部存在且属于该围栏**（否则 `422`）；路线内**门线不得重复**（否则 `422`）；**首点**不得给 `max_interval_s`、其余各点必须给出非负间隔（否则 `422`）；围栏不存在返回 `404`。
+- **删除保护**：被任一巡检路线引用的门线不得删除（返回 `409`，请先删除引用它的路线）；删除围栏时其路线与检查点一并删除。
+- 管理接口：`GET /fences/1/inspection-routes`（按 id 升序，检查点按 `position` 升序）、`DELETE /fences/1/inspection-routes/{route_id}`。
+
+提交设备轨迹后核验给定设备与半开时间窗 `[start, end)`：
+
+```bash
+curl 'http://localhost:8000/fences/1/inspection-routes/1/report?device_id=dev-001&start=2026-10-01T08:00:00Z&end=2026-10-01T09:00:00Z'
+```
+
+返回示例（全部通过）：
+
+```json
+{
+  "id": 1,
+  "fence_id": 1,
+  "name": "南门入园巡检",
+  "checkpoints": [
+    {"position": 0, "gate_id": 1, "direction": "forward", "direction_name": "南向北（入园）", "max_interval_s": null},
+    {"position": 1, "gate_id": 2, "direction": "forward", "direction_name": "南向北（二道岗）", "max_interval_s": 120.0},
+    {"position": 2, "gate_id": 3, "direction": "reverse", "direction_name": "北向南（折返）", "max_interval_s": 180.0}
+  ],
+  "created_at": "2026-10-01T07:30:00Z",
+  "device_id": "dev-001",
+  "start": "2026-10-01T08:00:00Z",
+  "end": "2026-10-01T09:00:00Z",
+  "passed": true,
+  "first_violation_at": null,
+  "results": [
+    {"position": 0, "gate_id": 1, "direction": "forward", "direction_name": "南向北（入园）",
+     "status": "passed", "passed_at": "2026-10-01T08:00:10Z", "failed_at": null},
+    {"position": 1, "gate_id": 2, "direction": "forward", "direction_name": "南向北（二道岗）",
+     "status": "passed", "passed_at": "2026-10-01T08:01:40Z", "failed_at": null},
+    {"position": 2, "gate_id": 3, "direction": "reverse", "direction_name": "北向南（折返）",
+     "status": "passed", "passed_at": "2026-10-01T08:03:30Z", "failed_at": null}
+  ]
+}
+```
+
+失败示例（检查点 1 超时）：
+
+```json
+{
+  "passed": false,
+  "first_violation_at": "2026-10-01T08:02:10Z",
+  "results": [
+    {"position": 0, "gate_id": 1, "direction": "forward", "direction_name": "南向北（入园）",
+     "status": "passed", "passed_at": "2026-10-01T08:00:10Z", "failed_at": null},
+    {"position": 1, "gate_id": 2, "direction": "forward", "direction_name": "南向北（二道岗）",
+     "status": "timeout", "passed_at": null, "failed_at": "2026-10-01T08:02:10Z"},
+    {"position": 2, "gate_id": 3, "direction": "reverse", "direction_name": "北向南（折返）",
+     "status": "not_reached", "passed_at": null, "failed_at": null}
+  ]
+}
+```
+
+**核验语义**：
+
+1. **按当前穿越记录时间重放**：取窗口内（`start <= ts < end`）该设备在路线门线上的穿越，按 `(ts, gate_id)` 升序，从检查点 0 开始逐个匹配。穿越时刻沿用门线核算的交点插值时刻。
+2. **推进规则**：只有穿越**下一个待匹配检查点**的门线**且方向一致**，才推进到下一检查点并记录该穿越时刻为通过时刻。
+3. **顺序违规（`sequence_violation`）**，立即终止重放，首个违规时刻即该穿越时刻：
+   - 当前检查点门线的**反向穿越**（违规记在当前检查点）；
+   - **任意后续检查点**门线的穿越（无论正反，说明先穿了后面的门；违规记在被穿的那个后续检查点）。
+4. **超时（`timeout`）**：自上一检查点通过时刻（首点为窗口 `start`）起，穿越发生时已**严格超过** `max_interval_s`（间隔**等于上限允许**），立即在**间隔截止时刻**标记超时——即使之后补穿匹配门线也不恢复；窗口结束仍未匹配且间隔已超限的，同样在间隔截止时刻标记超时。处理任一条穿越前先判超时，故超时优先于同一时刻之后的顺序违规。
+5. **忽略**：非路线门线的穿越、已通过检查点门线的再次穿越、窗口外的穿越一律忽略。
+6. **未到达（`not_reached`）**：此前已失败的剩余检查点，以及窗口结束时仍未匹配且尚未超间隔的检查点，均为 `not_reached`，无通过/失败时刻。
+7. **结果字段**：`passed` 仅当全部检查点均为 `passed`；`first_violation_at` 为首个 `timeout`/`sequence_violation` 的 `failed_at`（全部通过为 `null`）；`results` 按检查点顺序给出每点的 `status`、`passed_at` 与 `failed_at`。
+8. **实时重建、无快照**：报告**每次查询都从当前穿越记录重放**，不落库任何结果。补录乱序轨迹点（包括更早的点）触发穿越全量重算后，再次查询即按最新穿越结果重算通过时刻与违规判定，不保留旧快照。
+9. `start >= end` 返回 `422`；围栏/路线不存在或路线不属于该围栏返回 `404`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -320,8 +408,12 @@ curl http://localhost:8000/fences/1/clearance-tasks/1/report
 | GET | `/fences/{id}/occupancy` | 查询 `[start, end)` 占用分段与超限明细（必填 start/end） |
 | POST | `/fences/{id}/gates` | 新增定向门线（围栏内简单 LineString + 正/反向名称 + 最小位移） |
 | GET | `/fences/{id}/gates` | 门线列表（按 id 升序） |
-| DELETE | `/fences/{id}/gates/{gate_id}` | 删除门线及其穿越记录 |
+| DELETE | `/fences/{id}/gates/{gate_id}` | 删除门线及其穿越记录（被巡检路线引用时 409 拒绝） |
 | GET | `/crossings` | 门线穿越查询（device_id / gate_id / fence_id / direction / start / end，半开窗口） |
+| POST | `/fences/{id}/inspection-routes` | 新增有序门线巡检路线（2～8 个检查点：门线 + 方向 + 与上一点最长间隔） |
+| GET | `/fences/{id}/inspection-routes` | 巡检路线列表（按 id 升序，检查点按顺序） |
+| DELETE | `/fences/{id}/inspection-routes/{route_id}` | 删除巡检路线及其检查点（删除围栏时一并删除） |
+| GET | `/fences/{id}/inspection-routes/{route_id}/report` | 巡检核验报告（按设备 + `[start,end)` 由当前穿越记录重放：通过/超时/顺序违规/未到达 + 首个违规时刻） |
 | POST | `/fences/{id}/clearance-tasks` | 新增应急清场任务（名称 + 开始/截止时刻，开始须早于截止） |
 | GET | `/fences/{id}/clearance-tasks` | 清场任务列表（按 id 升序） |
 | DELETE | `/fences/{id}/clearance-tasks/{task_id}` | 删除清场任务（删除围栏时一并删除） |
@@ -355,11 +447,11 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验）
 Dockerfile / docker-compose.yml
 ```
 
